@@ -27,6 +27,18 @@ export {
   updateResume,
   downloadResumePdf,
   deleteResume,
+  startBatchTailor,
+  fetchBatchStatus,
+  addJobToQueue,
+  fetchJobQueue,
+  deleteQueueItem,
+  clearQueueItems,
+  parseJobMetadata,
+  type QueueItem,
+  type JobMetadata,
+  type BatchItem,
+  type BatchStatus,
+  type BatchTailorResponse,
   type ResumeListItem,
 } from './resume';
 

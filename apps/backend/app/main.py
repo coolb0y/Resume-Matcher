@@ -19,6 +19,7 @@ from app.config import settings
 from app.database import db
 from app.pdf import close_pdf_renderer, init_pdf_renderer
 from app.routers import config_router, enrichment_router, health_router, jobs_router, resumes_router
+from app.services.queue_worker import queue_manager as batch_manager
 
 
 def _configure_application_logging() -> None:
@@ -35,10 +36,14 @@ async def lifespan(app: FastAPI):
     """Application lifespan manager."""
     # Startup
     settings.data_dir.mkdir(parents=True, exist_ok=True)
-    # PDF renderer uses lazy initialization - will initialize on first use
-    # await init_pdf_renderer()
+    await batch_manager.start()
     yield
     # Shutdown - wrap each cleanup in try-except to ensure all resources are released
+    try:
+        await batch_manager.stop()
+    except Exception as e:
+        logger.error(f"Error stopping batch manager: {e}")
+
     try:
         await close_pdf_renderer()
     except Exception as e:

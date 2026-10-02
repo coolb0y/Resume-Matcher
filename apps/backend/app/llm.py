@@ -216,6 +216,7 @@ _PROVIDER_KEY_MAP: dict[str, str] = {
     "openrouter": "openrouter",
     "deepseek": "deepseek",
     "ollama": "ollama",
+    "groq": "groq",
 }
 
 
@@ -270,6 +271,7 @@ def get_model_name(config: LLMConfig) -> str:
         "gemini": "gemini/",
         "deepseek": "deepseek/",
         "ollama": "ollama_chat/",  # ollama_chat/ routes to /api/chat (supports messages array)
+        "groq": "groq/",
     }
 
     prefix = provider_prefixes.get(config.provider, "")
@@ -281,9 +283,19 @@ def get_model_name(config: LLMConfig) -> str:
             return config.model
         return f"openrouter/{config.model}"
 
+    if config.provider == "groq":
+        model = config.model
+        if model.startswith("groq/"):
+            return model
+        if model.startswith("gpt-oss-"):
+            model = f"openai/{model}"
+        elif model.startswith("qwen3.8-"):
+            model = f"qwen/{model}"
+        return f"groq/{model}"
+
     # For other providers, don't add prefix if model already has a known prefix
     known_prefixes = ["openrouter/", "anthropic/",
-                      "gemini/", "deepseek/", "ollama/", "ollama_chat/"]
+                      "gemini/", "deepseek/", "ollama/", "ollama_chat/", "groq/"]
     if any(config.model.startswith(p) for p in known_prefixes):
         return config.model
 
@@ -423,7 +435,7 @@ async def check_llm_health(
         kwargs: dict[str, Any] = {
             "model": model_name,
             "messages": [{"role": "user", "content": prompt}],
-            "max_tokens": 16,
+            "max_tokens": 64,
             "api_key": config.api_key,
             "api_base": _normalize_api_base(config.provider, config.api_base),
             "timeout": LLM_TIMEOUT_HEALTH_CHECK,
@@ -437,9 +449,14 @@ async def check_llm_health(
         if not content:
             # Check if the model responded with reasoning/thinking content
             message = response.choices[0].message
-            has_reasoning = getattr(message, "reasoning_content", None) or getattr(
-                message, "thinking", None)
-            if not has_reasoning:
+            has_reasoning = (
+                getattr(message, "reasoning_content", None)
+                or getattr(message, "thinking", None)
+                or getattr(message, "reasoning", None)
+            )
+            if has_reasoning:
+                content = str(has_reasoning)
+            else:
                 # LLM-003: Empty response should mark health check as unhealthy
                 logging.warning(
                     "LLM health check returned empty content",
@@ -640,6 +657,7 @@ def _calculate_timeout(
         "anthropic": 1.2,
         "openrouter": 1.5,  # More variable latency
         "ollama": 2.0,  # Local models can be slower
+        "groq": 0.8,  # Ultra-fast LPU inference
     }
     provider_factor = provider_factors.get(provider, 1.0)
 

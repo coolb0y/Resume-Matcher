@@ -1054,6 +1054,218 @@ async def improve_resume_confirm_endpoint(
         _raise_improve_error("confirm", stage, e, detail)
 
 
+async def execute_tailoring_pipeline(
+    resume_id: str,
+    job_id: str,
+    prompt_id: str | None = None,
+) -> tuple[dict[str, Any], dict[str, Any], list[dict[str, Any]], str, dict[str, Any]]:
+    """Core tailoring pipeline for a single resume and job description.
+
+    Returns:
+        (tailored_resume, improved_data, improvements, request_id, extra_meta)
+    """
+    resume = db.get_resume(resume_id)
+    if not resume:
+        raise HTTPException(status_code=404, detail="Resume not found")
+
+    job = db.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job description not found")
+
+    feature_config = _load_config()
+    enable_cover_letter = feature_config.get("enable_cover_letter", False)
+    enable_outreach = feature_config.get("enable_outreach_message", False)
+    language = get_content_language()
+
+    # Extract keywords from job description
+    job_keywords = await extract_job_keywords(job["content"])
+
+    effective_prompt_id = prompt_id or _get_default_prompt_id()
+    original_resume_data = _get_original_resume_data(resume)
+    response_warnings: list[str] = []
+
+    # Diff-based improvement: generate targeted changes, apply with verification
+    if original_resume_data:
+        diff_result = await generate_resume_diffs(
+            original_resume=resume["content"],
+            job_description=job["content"],
+            job_keywords=job_keywords,
+            language=language,
+            prompt_id=effective_prompt_id,
+            original_resume_data=original_resume_data,
+        )
+
+        improved_data, applied_changes, rejected_changes = apply_diffs(
+            original=original_resume_data,
+            changes=diff_result.changes,
+        )
+
+        diff_warnings = verify_diff_result(
+            original=original_resume_data,
+            result=improved_data,
+            applied_changes=applied_changes,
+            job_keywords=job_keywords,
+        )
+        response_warnings.extend(diff_warnings)
+
+        if rejected_changes:
+            response_warnings.append(
+                f"{len(rejected_changes)} change(s) rejected during verification"
+            )
+
+        logger.info(
+            "Diff-based improve (legacy): %d applied, %d rejected, %d warnings",
+            len(applied_changes),
+            len(rejected_changes),
+            len(diff_warnings),
+        )
+    else:
+        # Fallback to full-output mode when no structured data available
+        improved_data = await improve_resume(
+            original_resume=resume["content"],
+            job_description=job["content"],
+            job_keywords=job_keywords,
+            language=language,
+            prompt_id=effective_prompt_id,
+            original_resume_data=original_resume_data,
+        )
+
+    # Safety nets (defense in depth)
+    improved_data, preserve_warnings = _preserve_personal_info(
+        original_resume_data,
+        improved_data,
+    )
+    response_warnings.extend(preserve_warnings)
+
+    improved_data = _restore_original_dates(original_resume_data, improved_data)
+    original_markdown = _get_original_markdown(resume)
+    if original_markdown:
+        improved_data = restore_dates_from_markdown(improved_data, original_markdown)
+    improved_data = _preserve_original_skills(original_resume_data, improved_data)
+    improved_data = _protect_custom_sections(original_resume_data, improved_data)
+
+    # Multi-pass refinement: keyword injection, AI phrase removal, alignment validation
+    refinement_stats: RefinementStats | None = None
+    refinement_attempted = False
+    refinement_successful = False
+    try:
+        master_resume = db.get_master_resume()
+        master_data = (
+            _get_original_resume_data(master_resume)
+            if master_resume
+            else _get_original_resume_data(resume)
+        )
+        if master_data:
+            initial_match = calculate_keyword_match(improved_data, job_keywords)
+            refinement_attempted = True
+            refinement_result = await refine_resume(
+                initial_tailored=improved_data,
+                master_resume=master_data,
+                job_description=job["content"],
+                job_keywords=job_keywords,
+                config=RefinementConfig(),
+            )
+            improved_data = refinement_result.refined_data
+            refinement_stats = RefinementStats(
+                passes_completed=refinement_result.passes_completed,
+                keywords_injected=(
+                    len(refinement_result.keyword_analysis.injectable_keywords)
+                    if refinement_result.keyword_analysis
+                    else 0
+                ),
+                ai_phrases_removed=refinement_result.ai_phrases_removed,
+                alignment_violations_fixed=(
+                    len(
+                        [
+                            v
+                            for v in refinement_result.alignment_report.violations
+                            if v.severity == "critical"
+                        ]
+                    )
+                    if refinement_result.alignment_report
+                    else 0
+                ),
+                initial_match_percentage=initial_match,
+                final_match_percentage=refinement_result.final_match_percentage,
+            )
+            refinement_successful = True
+            logger.info(
+                "Refinement completed: %d passes, %d AI phrases removed",
+                refinement_result.passes_completed,
+                len(refinement_result.ai_phrases_removed),
+            )
+    except Exception as e:
+        logger.warning("Refinement failed, using unrefined result: %s", e)
+        if refinement_attempted:
+            response_warnings.append(f"Refinement failed: {str(e)}")
+
+    # Convert improved data to JSON string for storage
+    improved_text = json.dumps(improved_data, indent=2)
+
+    # Calculate differences between original and improved resume
+    diff_summary, detailed_changes, diff_error = _calculate_diff_from_resume(
+        resume,
+        improved_data,
+    )
+    if diff_error:
+        response_warnings.append(f"Could not calculate changes: {diff_error}")
+
+    # Generate improvement suggestions
+    improvements = generate_improvements(job_keywords)
+
+    # Generate cover letter, outreach message, and title in parallel if enabled
+    (
+        cover_letter,
+        outreach_message,
+        title,
+        aux_warnings,
+    ) = await _generate_auxiliary_messages(
+        improved_data,
+        job["content"],
+        language,
+        enable_cover_letter,
+        enable_outreach,
+    )
+    response_warnings.extend(aux_warnings)
+
+    # Store the tailored resume with cover letter, outreach message, and title
+    tailored_resume = db.create_resume(
+        content=improved_text,
+        content_type="json",
+        filename=f"tailored_{resume.get('filename', 'resume')}",
+        is_master=False,
+        parent_id=resume_id,
+        processed_data=improved_data,
+        processing_status="ready",
+        cover_letter=cover_letter,
+        outreach_message=outreach_message,
+        title=title,
+    )
+
+    # Store improvement record
+    request_id = str(uuid4())
+    db.create_improvement(
+        original_resume_id=resume_id,
+        tailored_resume_id=tailored_resume["resume_id"],
+        job_id=job_id,
+        improvements=improvements,
+    )
+
+    extra_meta = {
+        "improved_text": improved_text,
+        "cover_letter": cover_letter,
+        "outreach_message": outreach_message,
+        "diff_summary": diff_summary,
+        "detailed_changes": detailed_changes,
+        "refinement_stats": refinement_stats,
+        "warnings": response_warnings,
+        "refinement_attempted": refinement_attempted,
+        "refinement_successful": refinement_successful,
+    }
+
+    return tailored_resume, improved_data, improvements, request_id, extra_meta
+
+
 @router.post("/improve", response_model=ImproveResumeResponse)
 async def improve_resume_endpoint(
     request: ImproveResumeRequest,
@@ -1065,200 +1277,21 @@ async def improve_resume_endpoint(
     message if enabled in feature configuration.
     Persists the tailored resume and returns a non-null resume_id.
     """
-    # Fetch resume
-    resume = db.get_resume(request.resume_id)
-    if not resume:
-        raise HTTPException(status_code=404, detail="Resume not found")
-
-    # Fetch job description
-    job = db.get_job(request.job_id)
-    if not job:
-        raise HTTPException(status_code=404, detail="Job description not found")
-
-    # Load feature configuration and content language
-    feature_config = _load_config()
-    enable_cover_letter = feature_config.get("enable_cover_letter", False)
-    enable_outreach = feature_config.get("enable_outreach_message", False)
-    language = get_content_language()
-
     try:
-        # Extract keywords from job description
-        job_keywords = await extract_job_keywords(job["content"])
-
-        # Generate improved resume in the configured language
-        prompt_id = request.prompt_id or _get_default_prompt_id()
-
-        original_resume_data = _get_original_resume_data(resume)
-        # Collect warnings throughout the process
-        response_warnings: list[str] = []
-
-        # Diff-based improvement: generate targeted changes, apply with verification
-        if original_resume_data:
-            diff_result = await generate_resume_diffs(
-                original_resume=resume["content"],
-                job_description=job["content"],
-                job_keywords=job_keywords,
-                language=language,
-                prompt_id=prompt_id,
-                original_resume_data=original_resume_data,
-            )
-
-            improved_data, applied_changes, rejected_changes = apply_diffs(
-                original=original_resume_data,
-                changes=diff_result.changes,
-            )
-
-            diff_warnings = verify_diff_result(
-                original=original_resume_data,
-                result=improved_data,
-                applied_changes=applied_changes,
-                job_keywords=job_keywords,
-            )
-            response_warnings.extend(diff_warnings)
-
-            if rejected_changes:
-                response_warnings.append(
-                    f"{len(rejected_changes)} change(s) rejected during verification"
-                )
-
-            logger.info(
-                "Diff-based improve (legacy): %d applied, %d rejected, %d warnings",
-                len(applied_changes),
-                len(rejected_changes),
-                len(diff_warnings),
-            )
-        else:
-            # Fallback to full-output mode when no structured data available
-            improved_data = await improve_resume(
-                original_resume=resume["content"],
-                job_description=job["content"],
-                job_keywords=job_keywords,
-                language=language,
-                prompt_id=prompt_id,
-                original_resume_data=original_resume_data,
-            )
-
-        # Safety nets (defense in depth)
-        improved_data, preserve_warnings = _preserve_personal_info(
-            original_resume_data,
-            improved_data,
-        )
-        response_warnings.extend(preserve_warnings)
-
-        improved_data = _restore_original_dates(original_resume_data, improved_data)
-        original_markdown = _get_original_markdown(resume)
-        if original_markdown:
-            improved_data = restore_dates_from_markdown(improved_data, original_markdown)
-        improved_data = _preserve_original_skills(original_resume_data, improved_data)
-        improved_data = _protect_custom_sections(original_resume_data, improved_data)
-
-        # Multi-pass refinement: keyword injection, AI phrase removal, alignment validation
-        refinement_stats: RefinementStats | None = None
-        refinement_attempted = False
-        refinement_successful = False
-        try:
-            # Get master resume for alignment validation
-            master_resume = db.get_master_resume()
-            master_data = (
-                _get_original_resume_data(master_resume)
-                if master_resume
-                else _get_original_resume_data(resume)
-            )
-            if master_data:
-                initial_match = calculate_keyword_match(improved_data, job_keywords)
-                refinement_attempted = True
-                refinement_result = await refine_resume(
-                    initial_tailored=improved_data,
-                    master_resume=master_data,
-                    job_description=job["content"],
-                    job_keywords=job_keywords,
-                    config=RefinementConfig(),
-                )
-                improved_data = refinement_result.refined_data
-                refinement_stats = RefinementStats(
-                    passes_completed=refinement_result.passes_completed,
-                    keywords_injected=(
-                        len(refinement_result.keyword_analysis.injectable_keywords)
-                        if refinement_result.keyword_analysis
-                        else 0
-                    ),
-                    ai_phrases_removed=refinement_result.ai_phrases_removed,
-                    alignment_violations_fixed=(
-                        len(
-                            [
-                                v
-                                for v in refinement_result.alignment_report.violations
-                                if v.severity == "critical"
-                            ]
-                        )
-                        if refinement_result.alignment_report
-                        else 0
-                    ),
-                    initial_match_percentage=initial_match,
-                    final_match_percentage=refinement_result.final_match_percentage,
-                )
-                refinement_successful = True
-                logger.info(
-                    "Refinement completed: %d passes, %d AI phrases removed",
-                    refinement_result.passes_completed,
-                    len(refinement_result.ai_phrases_removed),
-                )
-        except Exception as e:
-            logger.warning("Refinement failed, using unrefined result: %s", e)
-            if refinement_attempted:
-                response_warnings.append(f"Refinement failed: {str(e)}")
-
-        # Convert improved data to JSON string for storage
-        improved_text = json.dumps(improved_data, indent=2)
-
-        # Calculate differences between original and improved resume
-        diff_summary, detailed_changes, diff_error = _calculate_diff_from_resume(
-            resume,
-            improved_data,
-        )
-        if diff_error:
-            response_warnings.append(f"Could not calculate changes: {diff_error}")
-
-        # Generate improvement suggestions
-        improvements = generate_improvements(job_keywords)
-
-        # Generate cover letter, outreach message, and title in parallel if enabled
         (
-            cover_letter,
-            outreach_message,
-            title,
-            aux_warnings,
-        ) = await _generate_auxiliary_messages(
+            tailored_resume,
             improved_data,
-            job["content"],
-            language,
-            enable_cover_letter,
-            enable_outreach,
-        )
-        response_warnings.extend(aux_warnings)
-
-        # Store the tailored resume with cover letter, outreach message, and title
-        tailored_resume = db.create_resume(
-            content=improved_text,
-            content_type="json",
-            filename=f"tailored_{resume.get('filename', 'resume')}",
-            is_master=False,
-            parent_id=request.resume_id,
-            processed_data=improved_data,
-            processing_status="ready",
-            cover_letter=cover_letter,
-            outreach_message=outreach_message,
-            title=title,
-        )
-
-        # Store improvement record
-        request_id = str(uuid4())
-        db.create_improvement(
-            original_resume_id=request.resume_id,
-            tailored_resume_id=tailored_resume["resume_id"],
+            improvements,
+            request_id,
+            meta,
+        ) = await execute_tailoring_pipeline(
+            resume_id=request.resume_id,
             job_id=request.job_id,
-            improvements=improvements,
+            prompt_id=request.prompt_id,
         )
+
+        original_resume = db.get_resume(request.resume_id)
+        original_content = original_resume.get("content", "") if original_resume else ""
 
         return ImproveResumeResponse(
             request_id=request_id,
@@ -1274,20 +1307,21 @@ async def improve_resume_endpoint(
                     }
                     for imp in improvements
                 ],
-                markdownOriginal=resume["content"],
-                markdownImproved=improved_text,
-                cover_letter=cover_letter,
-                outreach_message=outreach_message,
+                markdownOriginal=original_content,
+                markdownImproved=meta["improved_text"],
+                cover_letter=meta["cover_letter"],
+                outreach_message=meta["outreach_message"],
                 # Diff metadata
-                diff_summary=diff_summary,
-                detailed_changes=detailed_changes,
-                refinement_stats=refinement_stats,
-                warnings=response_warnings,
-                refinement_attempted=refinement_attempted,
-                refinement_successful=refinement_successful,
+                diff_summary=meta["diff_summary"],
+                detailed_changes=meta["detailed_changes"],
+                refinement_stats=meta["refinement_stats"],
+                warnings=meta["warnings"],
+                refinement_attempted=meta["refinement_attempted"],
+                refinement_successful=meta["refinement_successful"],
             ),
         )
-
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Resume improvement failed: {e}")
         raise HTTPException(

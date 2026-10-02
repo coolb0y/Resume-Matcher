@@ -326,7 +326,7 @@ async def update_prompt_config(
 
 
 # Supported API key providers
-SUPPORTED_PROVIDERS = ["openai", "anthropic", "google", "openrouter", "deepseek"]
+SUPPORTED_PROVIDERS = ["openai", "anthropic", "google", "openrouter", "deepseek", "groq"]
 
 
 def _mask_key_short(key: str | None) -> str | None:
@@ -345,11 +345,26 @@ async def get_api_keys_status() -> ApiKeyStatusResponse:
     Returns the configuration status for each supported provider.
     API keys are masked to show only the last 4 characters.
     """
+    import os
+
     stored_keys = get_api_keys_from_config()
+
+    env_key_map = {
+        "openai": "OPENAI_API_KEY",
+        "anthropic": "ANTHROPIC_API_KEY",
+        "google": "GEMINI_API_KEY",
+        "openrouter": "OPENROUTER_API_KEY",
+        "deepseek": "DEEPSEEK_API_KEY",
+        "groq": "GROQ_API_KEY",
+    }
 
     providers = []
     for provider in SUPPORTED_PROVIDERS:
         key = stored_keys.get(provider)
+        if not key:
+            key = os.environ.get(env_key_map.get(provider, "")) or (
+                settings.llm_api_key if settings.llm_provider == provider else ""
+            )
         providers.append(
             ApiKeyProviderStatus(
                 provider=provider,
@@ -406,6 +421,13 @@ async def update_api_keys(request: ApiKeysUpdateRequest) -> ApiKeysUpdateRespons
         elif "deepseek" in stored_keys:
             del stored_keys["deepseek"]
         updated.append("deepseek")
+
+    if request.groq is not None:
+        if request.groq:
+            stored_keys["groq"] = request.groq
+        elif "groq" in stored_keys:
+            del stored_keys["groq"]
+        updated.append("groq")
 
     save_api_keys_to_config(stored_keys)
     invalidate_config_cache()

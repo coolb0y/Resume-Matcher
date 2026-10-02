@@ -62,6 +62,7 @@ const PROVIDERS: LLMProvider[] = [
   'gemini',
   'deepseek',
   'ollama',
+  'groq',
 ];
 
 const SEGMENTED_BUTTON_BASE =
@@ -721,7 +722,7 @@ export default function SettingsPage() {
               {/* Provider Selection */}
               <div className="space-y-2">
                 <Label>{t('settings.providerLabel')}</Label>
-                <div className="grid grid-cols-3 md:grid-cols-6 gap-2">
+                <div className="grid grid-cols-2 sm:grid-cols-4 md:grid-cols-7 gap-2">
                   {PROVIDERS.map((p) => (
                     <button
                       key={p}
